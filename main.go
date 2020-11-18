@@ -29,8 +29,9 @@ import (
 // При возникновении ошибки обработки, требуется отменить все последующие расчеты, и вернуть ошибку
 
 const (
-	//limit           = 1000
-	limit           = 10
+	limit           = 1000
+	//limit           = 9
+	//limit           = 10
 	concurrencySize = 5
 )
 
@@ -68,49 +69,72 @@ func terminator(results <-chan int) {
 	}
 }
 
-func consumer(in <-chan int) error {
+func consumer(in <-chan int) (err error) {
 	var (
 		out   = make(chan int, limit)
 		w     = make(chan int, concurrencySize)
+		errCh = make(chan error, 1)
 
 		wg = sync.WaitGroup{}	// Для ожидания завершения горутин-воркеров
 	)
 	wg.Add(concurrencySize)
 
+	defer func(ch chan error, err *error) {
+		// Не совсем нравится такой вариант, потому что, на мой взгляд, могут быть проблемы, когда processor() будет
+		// возвращать разные ошибки и в этоге consumer() может вернуть не ту ошибку. Но такой "хак" необходим, чтобы
+		// обработать случай, когда limit=10, потому что там хоть и возникает ошибка, но for-select, который проходит
+		// по каналу видит, что всё нормально
+		close(ch)
+
+		if e, ok := <-ch; ok {
+			*err = e
+		}
+	}(errCh, &err)
+
+	defer close(out)
+	defer wg.Wait()
+	defer close(w)
+
 	go terminator(out)
 
 	for i := 0; i < concurrencySize; i++ {
-		go func(in <-chan int, out chan<- int, wg *sync.WaitGroup) {
-			for v := range w {
+		go func(in <-chan int, out chan<- int, errCh chan<- error, wg *sync.WaitGroup, i int) {
+			_, _ = fmt.Fprintf(os.Stdout, "[worker #%d] starting \n", i)
+
+			defer wg.Done()
+			defer fmt.Fprintf(os.Stdout, "[worker #%d] stopping \n", i)
+
+			for v := range in {
 				res, err := processor(v)
 				if err != nil {
-					panic(err)
+					_, _ = fmt.Fprintf(os.Stdout, "[worker #%d] got error %v \n", i, err)
+					errCh <- err
+					return
 				}
 
 				out <- res
 			}
-
-			wg.Done()
-		}(w, out, &wg)
+		}(w, out, errCh, &wg, i+1)
 	}
 
-	for v := range in {
-		_, _ = fmt.Fprintf(os.Stdout, "[consumer] consume value = %d \n", v)
-		w <- v
+	for {
+		select {
+		case v, ok := <-in:
+			if !ok {
+				return nil
+			}
+
+			_, _ = fmt.Fprintf(os.Stdout, "[consumer] consume value = %d \n", v)
+			w <- v
+		case err = <-errCh:
+			_, _ = fmt.Fprintf(os.Stdout, "[consumer] got error %v \n", err)
+			return err
+		}
 	}
-
-	close(w)
-
-	wg.Wait()
-
-	close(out)
-
-	return nil
 }
 
 func main() {
-	err := consumer(producer(limit))
-	if err != nil {
-		_, _ = fmt.Fprintln(os.Stderr, err)
+	if err := consumer(producer(limit)); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "[main] got error: %v \n", err)
 	}
 }
